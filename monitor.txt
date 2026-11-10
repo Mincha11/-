@@ -1,0 +1,143 @@
+// Монитор «поставщик — потребитель» на pthread.
+// Сборка: g++ -std=c++11 -Wall -Wextra -pthread monitor.cpp -o monitor
+
+#include <pthread.h>
+#include <unistd.h>
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
+// Событие с несериализуемыми данными: передаётся по указателю.
+class Event
+{
+public:
+    explicit Event(int n) : number(n), payload("данные события #" + std::to_string(n)) {}
+    void handle() const { /* здесь могла бы быть любая обработка */ }
+
+    int number;
+    std::string payload;
+};
+
+// Монитор: разделяемое состояние + мьютекс + условная переменная.
+class Monitor
+{
+public:
+    Monitor()
+    {
+        pthread_mutex_init(&mutex, nullptr);
+        pthread_cond_init(&condition, nullptr);
+    }
+
+    ~Monitor()
+    {
+        pthread_cond_destroy(&condition);
+        pthread_mutex_destroy(&mutex);
+    }
+
+    Monitor(const Monitor&) = delete;
+    Monitor& operator=(const Monitor&) = delete;
+
+    // Поставщик. Возвращает false, если предыдущее событие ещё не обработано
+    // (событие не принято, вызывающий повторит попытку позже).
+    bool provide(Event* event)
+    {
+        pthread_mutex_lock(&mutex);
+        if (ready)
+        {
+            pthread_mutex_unlock(&mutex);
+            return false;
+        }
+        data = event;
+        ready = true;
+        // Сообщение выводится под мьютексом: потребитель не сможет
+        // вывести своё сообщение раньше, порядок строго сохраняется.
+        printf("[поставщик]  отправлено событие #%d\n", event->number);
+        fflush(stdout);
+        pthread_cond_signal(&condition);
+        pthread_mutex_unlock(&mutex);
+        return true;
+    }
+
+    // Потребитель. Возвращает событие или nullptr, если монитор остановлен
+    // и необработанных событий больше нет.
+    Event* consume()
+    {
+        pthread_mutex_lock(&mutex);
+        // Ожидание в цикле: защита от ложных пробуждений
+        // и от уведомления, пришедшего до начала ожидания.
+        while (!ready && !stopping)
+            pthread_cond_wait(&condition, &mutex);   // мьютекс временно освобождается
+        if (!ready)                                  // stopping и данных нет
+        {
+            pthread_mutex_unlock(&mutex);
+            return nullptr;
+        }
+        Event* event = data;
+        data = nullptr;
+        ready = false;
+        printf("[потребитель] получено событие #%d\n", event->number);
+        fflush(stdout);
+        pthread_mutex_unlock(&mutex);
+        return event;                                // обработка уже вне мьютекса
+    }
+
+    // Завершение: разбудить всех ожидающих.
+    void stop()
+    {
+        pthread_mutex_lock(&mutex);
+        stopping = true;
+        pthread_cond_broadcast(&condition);
+        pthread_mutex_unlock(&mutex);
+    }
+
+private:
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    bool ready = false;
+    bool stopping = false;
+    Event* data = nullptr;
+};
+
+static const int EVENT_COUNT = 5;
+
+static void* producerThread(void* arg)
+{
+    Monitor* monitor = static_cast<Monitor*>(arg);
+    for (int i = 1; i <= EVENT_COUNT; ++i)
+    {
+        sleep(1);                         // задержка в одну секунду
+        Event* event = new Event(i);
+        while (!monitor->provide(event))  // предыдущее ещё не обработано
+            usleep(10000);                // повторить попытку позже
+    }
+    monitor->stop();
+    return nullptr;
+}
+
+static void* consumerThread(void* arg)
+{
+    Monitor* monitor = static_cast<Monitor*>(arg);
+    while (Event* event = monitor->consume())
+    {
+        event->handle();
+        delete event;
+    }
+    return nullptr;
+}
+
+int main()
+{
+    Monitor monitor;
+    pthread_t producer, consumer;
+
+    if (pthread_create(&consumer, nullptr, consumerThread, &monitor) != 0 ||
+        pthread_create(&producer, nullptr, producerThread, &monitor) != 0)
+    {
+        fprintf(stderr, "Не удалось создать поток\n");
+        return EXIT_FAILURE;
+    }
+    pthread_join(producer, nullptr);
+    pthread_join(consumer, nullptr);
+    // Монитор уничтожается после завершения обоих потоков.
+    return EXIT_SUCCESS;
+}
